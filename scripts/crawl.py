@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 """
-腾讯视频全量爬虫 V8 - 修正iyear映射 + 全维度交叉爬取
-关键修正：
-  1. 使用API返回的正确iyear筛选值（非旧版1-17）
-  2. 电视剧: 11个年份段 × 3种排序 + 撞上限的年份按地区拆分
-  3. 电影: 20个年份段 × 3种排序
-  4. 合并去重 → 过滤短剧 → 确定付费类型
+腾讯视频全量爬虫 V9 - 增强过滤版
+基于V8，新增三项过滤规则：
+  1. 过滤仅有预告片的待播影剧（getinfo返回no_video/td=0）
+  2. 过滤外站播放链接（getinfo返回no_video）
+  3. 过滤集均时长<20min的短剧（td≤1200s）
+关键改进：
+  - 保存中间数据含VID，支持断点续跑
+  - getinfo检查所有条目（非仅TV）
+  - 返回status+duration双重信号
 """
 
-import requests, json, time, sys
+import requests, json, time, sys, os
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -20,6 +23,11 @@ HEADERS = {
     "Referer": "https://v.qq.com/channel/tv/list",
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
 }
+
+# ===== Checkpoints =====
+CHECKPOINT_CRAWL = "/tmp/tencent_v9_crawl.json"
+CHECKPOINT_DURATIONS = "/tmp/tencent_v9_durations.json"
+OUTPUT_FILE = "/tmp/tencent_video_v9.json"
 
 # ===== 正确的筛选维度 =====
 TV_YEARS = [
@@ -43,6 +51,9 @@ MV_AREAS = [(100024, "内地"), (100025, "中国香港"), (100026, "中国台湾
 
 FEMALE_GENRES = {"爱情", "家庭", "青春", "古装", "宫斗", "甜宠", "都市"}
 MALE_GENRES = {"军旅", "刑侦", "竞技", "武侠", "科幻", "战争", "谍战", "悬疑", "权谋", "猎奇"}
+
+# ===== 独播修正名单 =====
+FORCE_NON_EXCLUSIVE = {"姐妹情缘", "金山", "走路上学", "泥鳅也是鱼", "北川重生"}
 
 def fetch_page(channel_id, filter_params, page_context=None):
     body = {"page_params": {"page_type": "operation", "page_id": "channel_list", "channel_id": channel_id, "filter_params": filter_params}}
@@ -92,9 +103,11 @@ def parse_items(api_data):
             # 第一集VID
             first_vid = ""
             all_ids_raw = p.get("all_ids", "")
+            all_ids_count = 0
             if all_ids_raw:
                 try:
                     all_ids = json.loads(all_ids_raw) if isinstance(all_ids_raw, str) else all_ids_raw
+                    all_ids_count = len(all_ids)
                     if all_ids:
                         first_vid = all_ids[0].get("V", "")
                 except: pass
@@ -123,6 +136,8 @@ def parse_items(api_data):
                 "exclusive": exclusive,
                 "genre_tags": "、".join(genre_tags),
                 "first_vid": first_vid,
+                "all_ids_count": all_ids_count,
+                "first_F": str(p.get("first_F", "")),
                 "pay_type": "",
             })
     except:
@@ -176,34 +191,48 @@ def merge_items(all_items_list):
             for key in ["episode_info", "first_vid", "genre_tags"]:
                 if not old.get(key) and it.get(key):
                     merged[cid][key] = it[key]
+            if it.get("all_ids_count", 0) > old.get("all_ids_count", 0):
+                merged[cid]["all_ids_count"] = it["all_ids_count"]
     return list(merged.values())
 
-def get_vid_duration(vid):
-    try:
-        resp = requests.get(VID_INFO_URL, params={"vid": vid, "platform": "10201", "otype": "json", "defn": "sd"},
-                           headers={"Referer": "https://v.qq.com/", "User-Agent": "Mozilla/5.0"}, timeout=10)
-        text = resp.text
-        if text.startswith("QZOutputJson="): text = text[len("QZOutputJson="):]
-        if text.endswith(";"): text = text[:-1]
-        data = json.loads(text)
-        vi_list = data.get("vl", {}).get("vi", [])
-        if vi_list:
-            return float(vi_list[0].get("td", "0"))
-    except: pass
-    return -1
+def get_vid_info(vid):
+    """返回 (duration_seconds, status_str)"""
+    for attempt in range(2):
+        try:
+            resp = requests.get(VID_INFO_URL, params={"vid": vid, "platform": "10201", "otype": "json", "defn": "sd"},
+                               headers={"Referer": "https://v.qq.com/", "User-Agent": "Mozilla/5.0"}, timeout=10)
+            text = resp.text
+            if text.startswith("QZOutputJson="): text = text[len("QZOutputJson="):]
+            if text.endswith(";"): text = text[:-1]
+            data = json.loads(text)
+            vi_list = data.get("vl", {}).get("vi", [])
+            if vi_list:
+                td = float(vi_list[0].get("td", "0"))
+                return (td, "ok")
+            # No vi list → check for error msg
+            msg = data.get("msg", "")
+            if "no_video" in msg or not vi_list:
+                return (0, "no_video")
+        except Exception as e:
+            if attempt == 0:
+                time.sleep(1)
+    return (-1, "error")
 
-def get_durations_batch(vid_list, max_workers=20):
+def get_vid_infos_batch(vid_list, max_workers=30):
     results = {}
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_map = {executor.submit(get_vid_duration, vid): vid for vid in vid_list if vid}
+        future_map = {executor.submit(get_vid_info, vid): vid for vid in vid_list if vid}
         done = 0
+        total = len(future_map)
         for future in as_completed(future_map):
             vid = future_map[future]
-            try: results[vid] = future.result()
-            except: results[vid] = -1
+            try:
+                results[vid] = future.result()
+            except:
+                results[vid] = (-1, "error")
             done += 1
             if done % 500 == 0:
-                print(f"      duration checked: {done}/{len(future_map)}", flush=True)
+                print(f"      getinfo checked: {done}/{total}", flush=True)
     return results
 
 def determine_gender(main_genre, genre_tags_str):
@@ -219,11 +248,18 @@ def determine_gender(main_genre, genre_tags_str):
     return "通用"
 
 
-def main():
-    # ============ 电视剧: 全维度爬取 ============
+def phase1_crawl():
+    """Phase 1: 爬取全量数据并保存含VID的中间数据"""
+    if os.path.exists(CHECKPOINT_CRAWL):
+        print(f"\n[Phase 1] 加载爬取缓存: {CHECKPOINT_CRAWL}", flush=True)
+        with open(CHECKPOINT_CRAWL, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        print(f"  电视剧: {len(data['tv'])} 部, 电影: {len(data['movie'])} 部", flush=True)
+        return data
+
     print("=" * 60)
-    print("电视剧: 年份×排序 全维度爬取")
-    print("=" * 60)
+    print("[Phase 1] 电视剧: 年份x排序 全维度爬取")
+    print("=" * 60, flush=True)
 
     tv_all = []
 
@@ -233,7 +269,7 @@ def main():
             fp = f"sort={sval}&iyear={yval}"
             items = crawl_all_pages("100113", fp)
             tv_all.extend(items)
-            print(f"  {ylabel} × {slabel}: {len(items)}", flush=True)
+            print(f"  {ylabel} x {slabel}: {len(items)}", flush=True)
             time.sleep(0.1)
 
     # 维度2: 撞上限的年份段(2010-2000)按地区拆分
@@ -244,63 +280,58 @@ def main():
             items = crawl_all_pages("100113", fp)
             if items:
                 tv_all.extend(items)
-                print(f"    {alabel} × {slabel}: {len(items)}", flush=True)
+                print(f"    {alabel} x {slabel}: {len(items)}", flush=True)
             time.sleep(0.1)
 
     # 维度3: 无年份的各sort
     for sval, slabel in TV_SORTS:
         items = crawl_all_pages("100113", f"sort={sval}")
         tv_all.extend(items)
-        print(f"  全部 × {slabel}: {len(items)}", flush=True)
+        print(f"  全部 x {slabel}: {len(items)}", flush=True)
 
     tv_merged = merge_items(tv_all)
     print(f"\n  电视剧合并去重: {len(tv_all)} -> {len(tv_merged)} 部", flush=True)
 
-    # ============ 电影: 全维度爬取 ============
+    # ============ 电影 ============
     print(f"\n{'=' * 60}")
-    print("电影: 年份×排序 全维度爬取")
-    print("=" * 60)
+    print("[Phase 1] 电影: 年份x排序 全维度爬取")
+    print("=" * 60, flush=True)
 
     movie_all = []
 
-    # 维度1: 每个年份段 × 每种排序
     for yval, ylabel in MV_YEARS:
         for sval, slabel in MV_SORTS:
             fp = f"sort={sval}&iyear={yval}"
             items = crawl_all_pages("100173", fp)
             movie_all.extend(items)
-            print(f"  {ylabel} × {slabel}: {len(items)}", flush=True)
+            print(f"  {ylabel} x {slabel}: {len(items)}", flush=True)
             time.sleep(0.1)
 
-    # 维度2: 无年份的各sort
     for sval, slabel in MV_SORTS:
         items = crawl_all_pages("100173", f"sort={sval}")
         movie_all.extend(items)
-        print(f"  全部 × {slabel}: {len(items)}", flush=True)
+        print(f"  全部 x {slabel}: {len(items)}", flush=True)
 
     movie_merged = merge_items(movie_all)
     print(f"\n  电影合并去重: {len(movie_all)} -> {len(movie_merged)} 部", flush=True)
 
     # ============ 确定付费类型 ============
     print(f"\n{'=' * 60}")
-    print("确定付费类型")
-    print("=" * 60)
+    print("[Phase 1] 确定付费类型")
+    print("=" * 60, flush=True)
 
-    # 电视剧付费: ipay=1(免费), 2(限免), 3(会员)
-    tv_pay_sort = TV_SORTS[0][0]  # 用最热排序
-    tv_free = crawl_titles_set("100113", f"sort={tv_pay_sort}&ipay=1")
-    tv_limited = crawl_titles_set("100113", f"sort={tv_pay_sort}&ipay=2")
-    tv_vip = crawl_titles_set("100113", f"sort={tv_pay_sort}&ipay=3")
+    tv_free = crawl_titles_set("100113", f"sort=75&ipay=1")
+    tv_limited = crawl_titles_set("100113", f"sort=75&ipay=2")
+    tv_vip = crawl_titles_set("100113", f"sort=75&ipay=3")
     print(f"  电视剧: 免费{len(tv_free)}, 限免{len(tv_limited)}, 会员{len(tv_vip)}", flush=True)
 
     for it in tv_merged:
         t = it["title"]
         if t in tv_free: it["pay_type"] = "免费"
-        elif t in tv_limited: it["pay_type"] = "会员"  # 限免归为会员
+        elif t in tv_limited: it["pay_type"] = "会员"
         elif t in tv_vip: it["pay_type"] = "会员"
         else: it["pay_type"] = "付费"
 
-    # 电影付费: ipay=1(免费), 8(会员), 4(付费), 3300(限免)
     mv_free = crawl_titles_set("100173", f"sort=75&ipay=1")
     mv_vip = crawl_titles_set("100173", f"sort=75&ipay=8")
     mv_paid = crawl_titles_set("100173", f"sort=75&ipay=4")
@@ -315,76 +346,178 @@ def main():
         elif t in mv_paid: it["pay_type"] = "付费"
         else: it["pay_type"] = "付费"
 
-    # ============ 过滤短剧 ============
+    # Save checkpoint
+    data = {"tv": tv_merged, "movie": movie_merged}
+    with open(CHECKPOINT_CRAWL, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    print(f"\n  爬取完成，保存到 {CHECKPOINT_CRAWL}", flush=True)
+    print(f"  电视剧: {len(tv_merged)} 部, 电影: {len(movie_merged)} 部", flush=True)
+
+    return data
+
+
+def phase2_check_durations(data):
+    """Phase 2: 检查所有条目的getinfo状态和时长"""
+    if os.path.exists(CHECKPOINT_DURATIONS):
+        print(f"\n[Phase 2] 加载时长缓存: {CHECKPOINT_DURATIONS}", flush=True)
+        with open(CHECKPOINT_DURATIONS, "r", encoding="utf-8") as f:
+            return json.load(f)
+
     print(f"\n{'=' * 60}")
-    print("过滤短剧 (单集≤20分钟)")
-    print("=" * 60)
+    print("[Phase 2] 检查所有VID时长和状态")
+    print("=" * 60, flush=True)
 
-    tv_vids = [it["first_vid"] for it in tv_merged if it["first_vid"]]
-    print(f"  电视剧: 检查 {len(tv_vids)} 部时长...", flush=True)
-    tv_durations = get_durations_batch(tv_vids, max_workers=20)
+    all_items = data["tv"] + data["movie"]
+    all_vids = list(set(it["first_vid"] for it in all_items if it.get("first_vid")))
+    print(f"  共 {len(all_vids)} 个唯一VID需检查", flush=True)
 
-    filtered_tv = []
-    short_count = 0
-    for it in tv_merged:
-        vid = it["first_vid"]
-        dur = tv_durations.get(vid, -1)
-        dur_min = dur / 60 if dur > 0 else -1
-        if dur_min > 0 and dur_min <= 20:
-            short_count += 1
-        else:
-            filtered_tv.append(it)
-    print(f"  电视剧: 排除 {short_count} 部短剧, 保留 {len(filtered_tv)} 部", flush=True)
+    vid_infos = get_vid_infos_batch(all_vids, max_workers=30)
 
-    mv_vids = [it["first_vid"] for it in movie_merged if it["first_vid"]]
-    print(f"  电影: 检查 {len(mv_vids)} 部时长...", flush=True)
-    mv_durations = get_durations_batch(mv_vids, max_workers=20)
+    # Convert tuples to lists for JSON serialization
+    results = {}
+    for vid, (td, status) in vid_infos.items():
+        results[vid] = {"td": td, "status": status}
 
-    filtered_movie = []
-    short_mv = 0
-    for it in movie_merged:
-        vid = it["first_vid"]
-        dur = mv_durations.get(vid, -1)
-        dur_min = dur / 60 if dur > 0 else -1
-        if dur_min > 0 and dur_min <= 20:
-            short_mv += 1
-        else:
-            if dur > 0:
-                it["episode_info"] = f"{int(dur / 60)}分钟"
-            filtered_movie.append(it)
-    print(f"  电影: 排除 {short_mv} 部短片, 保留 {len(filtered_movie)} 部", flush=True)
+    # Stats
+    ok_count = sum(1 for v in results.values() if v["status"] == "ok" and v["td"] > 0)
+    no_video = sum(1 for v in results.values() if v["status"] == "no_video" or (v["status"] == "ok" and v["td"] == 0))
+    err_count = sum(1 for v in results.values() if v["status"] == "error")
+    print(f"  结果: 有视频={ok_count}, 无视频/td=0={no_video}, 错误={err_count}", flush=True)
 
-    # ============ 输出 ============
+    with open(CHECKPOINT_DURATIONS, "w", encoding="utf-8") as f:
+        json.dump(results, f, ensure_ascii=False, indent=2)
+    print(f"  时长数据保存到 {CHECKPOINT_DURATIONS}", flush=True)
+
+    return results
+
+
+def phase3_filter_and_output(data, durations):
+    """Phase 3: 应用V9过滤规则 + 独播修正 + 输出"""
+    print(f"\n{'=' * 60}")
+    print("[Phase 3] 应用V9过滤规则")
+    print("=" * 60, flush=True)
+
     output = {}
-    for name, items in [("电视剧", filtered_tv), ("电影", filtered_movie)]:
-        output[name] = []
+    total_removed = {"trailer_novideo": 0, "short_drama": 0}
+
+    for category, items in [("电视剧", data["tv"]), ("电影", data["movie"])]:
+        kept = []
+        removed_trailer = []
+        removed_short = []
+
         for it in items:
-            output[name].append({
+            vid = it.get("first_vid", "")
+            dur_info = durations.get(vid, {"td": -1, "status": "unknown"})
+            td = dur_info.get("td", -1)
+            status = dur_info.get("status", "unknown")
+
+            # Rule 1+2: 待播预告 / 外站链接 → getinfo返回no_video或td=0
+            if status == "no_video" or (status == "ok" and td == 0):
+                removed_trailer.append(it["title"])
+                continue
+
+            # Rule 3: 短剧 (0 < td <= 1200 即 ≤20分钟)
+            if td > 0 and td <= 1200:
+                removed_short.append(it["title"])
+                continue
+
+            # 通过筛选 → 保留
+            kept.append(it)
+
+        print(f"\n  {category}:", flush=True)
+        print(f"    原始: {len(items)} 部", flush=True)
+        print(f"    移除(无视频/预告/外站): {len(removed_trailer)} 部", flush=True)
+        print(f"    移除(短剧≤20min): {len(removed_short)} 部", flush=True)
+        print(f"    保留: {len(kept)} 部", flush=True)
+
+        total_removed["trailer_novideo"] += len(removed_trailer)
+        total_removed["short_drama"] += len(removed_short)
+
+        if removed_trailer:
+            print(f"    [无视频/预告/外站 样本]: {removed_trailer[:10]}", flush=True)
+        if removed_short:
+            print(f"    [短剧 样本]: {removed_short[:10]}", flush=True)
+
+        # ===== 独播修正 =====
+        corrected = 0
+        for it in kept:
+            title = it["title"]
+
+            # 修正1: 用户指定的非独播名单
+            if title in FORCE_NON_EXCLUSIVE and it["exclusive"] == "独播":
+                it["exclusive"] = "非独播"
+                corrected += 1
+
+            # 修正2: 2016年前的电影，标记为独播但实际在多平台
+            if category == "电影" and it["exclusive"] == "独播":
+                try:
+                    y = int(it["year"]) if it["year"] else 9999
+                    if y < 2016:
+                        it["exclusive"] = "非独播"
+                        corrected += 1
+                except:
+                    pass
+
+        if corrected:
+            print(f"    独播修正: {corrected} 部", flush=True)
+
+        # 构建输出
+        output[category] = []
+        for it in kept:
+            # 电影：用时长替换集数
+            ep_info = it["episode_info"]
+            if category == "电影":
+                vid = it.get("first_vid", "")
+                dur_info = durations.get(vid, {"td": -1})
+                td = dur_info.get("td", -1)
+                if td > 0:
+                    ep_info = f"{int(td / 60)}分钟"
+
+            output[category].append({
                 "平台": "腾讯视频",
                 "剧名": it["title"],
-                "类型": name,
+                "类型": category,
                 "是否独播": it["exclusive"],
                 "付费类型": it["pay_type"],
                 "年份": it["year"],
                 "演员": it["leading_actor"],
                 "地区": it["area_name"],
-                "集数": it["episode_info"],
+                "集数": ep_info,
                 "题材": it["main_genre"],
                 "男女频": determine_gender(it["main_genre"], it["genre_tags"]),
             })
 
-    with open("/tmp/tencent_video_v8_raw.json", "w", encoding="utf-8") as f:
+    # 保存最终数据
+    with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
         json.dump(output, f, ensure_ascii=False, indent=2)
 
     total = sum(len(v) for v in output.values())
     print(f"\n{'=' * 60}")
-    print(f"完成! 总计 {total} 部")
+    print(f"V9 完成! 总计 {total} 部")
+    print(f"  移除(无视频/预告/外站): {total_removed['trailer_novideo']} 部")
+    print(f"  移除(短剧≤20min): {total_removed['short_drama']} 部")
     for name, items in output.items():
         excl = sum(1 for it in items if it["是否独播"] == "独播")
         pay = Counter(it["付费类型"] for it in items)
         print(f"  {name}: {len(items)} 部, 独播{excl}")
         print(f"    付费: {dict(pay)}")
-    print(f"\n数据已保存到 /tmp/tencent_video_v8_raw.json", flush=True)
+    print(f"\n数据已保存到 {OUTPUT_FILE}", flush=True)
+
+
+def main():
+    print("腾讯视频全量爬虫 V9 - 增强过滤版")
+    print(f"时间: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+    print("=" * 60, flush=True)
+
+    # Phase 1: 爬取
+    data = phase1_crawl()
+
+    # Phase 2: 检查时长
+    durations = phase2_check_durations(data)
+
+    # Phase 3: 过滤输出
+    phase3_filter_and_output(data, durations)
+
 
 if __name__ == "__main__":
     main()
